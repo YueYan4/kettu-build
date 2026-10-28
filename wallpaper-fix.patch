@@ -1,0 +1,134 @@
+diff --git a/src/lib/addons/themes/colors/patches/background.tsx b/src/lib/addons/themes/colors/patches/background.tsx
+index 29266c2..1c8664b 100644
+--- a/src/lib/addons/themes/colors/patches/background.tsx
++++ b/src/lib/addons/themes/colors/patches/background.tsx
+@@ -3,12 +3,18 @@ import { _colorRef } from "@lib/addons/themes/colors/updater";
+ import { after } from "@lib/api/patcher";
+ import { useObservable } from "@lib/api/storage";
+ import { findInReactTree } from "@lib/utils";
+-import { findByDisplayNameLazy } from "@metro";
++import { findByFilePath } from "@metro";
+ import chroma from "chroma-js";
+ import { ImageBackground, StyleSheet } from "react-native";
+ import { logger } from "@lib/utils/logger";
+ 
+-const MessagesModule = findByDisplayNameLazy("MessagesConnected", false);
++// Discord has moved the chat screen over time, and some accounts get an A/B-tested
++// rewrite (MessagesFunctional), so hook every known location that exists
++const MESSAGES_PATHS = [
++    "components_native/chat/Messages.tsx",
++    "components_native/chat/MessagesFunctional.tsx",
++    "modules/messages/native/Messages.tsx"
++];
+ 
+ function ThemeBackground({ children }: { children: React.ReactNode; }) {
+     useObservable([colorsPref]);
+@@ -30,42 +36,74 @@ function ThemeBackground({ children }: { children: React.ReactNode; }) {
+     </ImageBackground>;
+ }
+ 
++const patch = (_: any, ret: any) => {
++    if (!_colorRef.current || !_colorRef.current.background?.url) return;
++
++    const messagesComponent = findInReactTree(
++        ret,
++        x => x && "HACK_fixModalInteraction" in x.props && x?.props?.style
++    );
++
++    if (messagesComponent) {
++        const flattened = StyleSheet.flatten(messagesComponent.props.style);
++        const backgroundColor = chroma(
++            flattened.backgroundColor || "black"
++        ).alpha(
++            1 - (_colorRef.current.background?.opacity ?? 1)
++        ).hex();
++
++        messagesComponent.props.style = StyleSheet.flatten([
++            messagesComponent.props.style,
++            { backgroundColor }
++        ]);
++    }
++
++    return <ThemeBackground>{ret}</ThemeBackground>;
++};
++
++// Returns [object, method] pairs to patch for whichever chat screens are loaded
++function findTargets() {
++    const targets: [any, string][] = [];
++
++    for (const path of MESSAGES_PATHS) {
++        try {
++            const mod = findByFilePath(path, false);
++            const d = mod?.default;
++            if (typeof d?.render === "function") targets.push([d, "render"]);
++            else if (typeof d?.type?.render === "function") targets.push([d.type, "render"]);
++            else if (typeof d === "function") targets.push([mod, "default"]);
++        } catch { }
++    }
++
++    return targets;
++}
++
+ export default function patchChatBackground() {
+-    try {
+-        const patch = (_: any, ret: any) => {
+-            if (!_colorRef.current || !_colorRef.current.background?.url) return;
+-
+-            const messagesComponent = findInReactTree(
+-                ret,
+-                x => x && "HACK_fixModalInteraction" in x.props && x?.props?.style
+-            );
+-
+-            if (messagesComponent) {
+-                const flattened = StyleSheet.flatten(messagesComponent.props.style);
+-                const backgroundColor = chroma(
+-                    flattened.backgroundColor || "black"
+-                ).alpha(
+-                    1 - (_colorRef.current.background?.opacity ?? 1)
+-                ).hex();
+-
+-                messagesComponent.props.style = StyleSheet.flatten([
+-                    messagesComponent.props.style,
+-                    { backgroundColor }
+-                ]);
+-            }
+-
+-            return <ThemeBackground>{ret}</ThemeBackground>;
+-        }
++    const patches: (() => void)[] = [];
++    let tries = 0;
+ 
+-        const patches = [
+-            typeof MessagesModule.default === "function"
+-                ? after("default", MessagesModule, patch)
+-                : after("render", MessagesModule.default, patch)
+-        ];
++    // The chat screen loads after Kettu starts, so keep looking for a while
++    const attempt = () => {
++        try {
++            const targets = findTargets();
++            if (!targets.length) return ++tries >= 60;
+ 
+-        return () => patches.forEach(x => x());
+-    } catch (e) {
+-        logger.error("Failed to patch chat background.", e);
+-        return () => { };
++            for (const [obj, method] of targets) patches.push(after(method, obj, patch));
++        } catch (e) {
++            logger.error("Failed to patch chat background.", e);
++        }
++        return true;
++    };
++
++    let timer: ReturnType<typeof setInterval> | undefined;
++    if (!attempt()) {
++        timer = setInterval(() => {
++            if (attempt()) clearInterval(timer);
++        }, 2000);
+     }
++
++    return () => {
++        clearInterval(timer);
++        patches.forEach(x => x());
++    };
+ }
